@@ -1,0 +1,372 @@
+// src/services/geminiService.js - Free models only
+const axios = require("axios");
+const config = require("../config/environment");
+const logger = require("../utils/logger");
+
+class GeminiService {
+  constructor() {
+    this.apiKey = config.apis.gemini.apiKey;
+    this.baseURL = "https://generativelanguage.googleapis.com/v1beta/models";
+
+    this.models = ["gemini-3.5-flash-lite", "gemini-3.6-flash"];
+  }
+
+  async generateResponse(query, context, retryCount = 0) {
+    const maxRetries = 5;
+    const retryDelays = [2000, 5000, 10000, 15000, 20000];
+
+    for (let modelIndex = 0; modelIndex < this.models.length; modelIndex++) {
+      const model = this.models[modelIndex];
+
+      try {
+        if (!this.apiKey) {
+          throw new Error("Gemini API key not configured");
+        }
+
+        const prompt = this.buildPrompt(query, context);
+
+        const requestData = {
+          contents: [
+            {
+              parts: [
+                {
+                  text: prompt,
+                },
+              ],
+            },
+          ],
+          generationConfig: {
+            temperature: 0.7,
+            topK: 40,
+            topP: 0.95,
+            maxOutputTokens: 1024,
+            candidateCount: 1,
+          },
+          safetySettings: [
+            {
+              category: "HARM_CATEGORY_HARASSMENT",
+              threshold: "BLOCK_MEDIUM_AND_ABOVE",
+            },
+            {
+              category: "HARM_CATEGORY_HATE_SPEECH",
+              threshold: "BLOCK_MEDIUM_AND_ABOVE",
+            },
+            {
+              category: "HARM_CATEGORY_SEXUALLY_EXPLICIT",
+              threshold: "BLOCK_MEDIUM_AND_ABOVE",
+            },
+            {
+              category: "HARM_CATEGORY_DANGEROUS_CONTENT",
+              threshold: "BLOCK_MEDIUM_AND_ABOVE",
+            },
+          ],
+        };
+
+        logger.info(
+          `🆓 Using FREE model: ${model} (${modelIndex + 1}/${this.models.length}, attempt ${retryCount + 1}/${maxRetries + 1})`,
+        );
+
+        const response = await axios.post(
+          `${this.baseURL}/${model}:generateContent`,
+          requestData,
+          {
+            headers: {
+              "Content-Type": "application/json",
+              "x-goog-api-key": this.apiKey,
+            },
+            timeout: 30000,
+          },
+        );
+
+        if (
+          !response.data ||
+          !response.data.candidates ||
+          !response.data.candidates[0]
+        ) {
+          throw new Error("Invalid response format from Gemini API");
+        }
+
+        const candidate = response.data.candidates[0];
+
+        // Check if response was blocked
+        if (candidate.finishReason === "SAFETY") {
+          throw new Error("Response was blocked by safety filters");
+        }
+
+        if (
+          !candidate.content ||
+          !candidate.content.parts ||
+          !candidate.content.parts[0]
+        ) {
+          throw new Error("No content in Gemini response");
+        }
+
+        const generatedText = candidate.content.parts[0].text;
+        logger.info(
+          `✅ Successfully generated response from FREE model: ${model}`,
+        );
+
+        return generatedText.trim();
+      } catch (error) {
+        this.logDetailedError(`${model}-attempt-${retryCount}`, error);
+
+        if (error.response?.status === 503) {
+          logger.warn(`⚠️  FREE model ${model} is overloaded (503)`);
+
+          if (modelIndex < this.models.length - 1) {
+            logger.info(`🔄 Trying next FREE model...`);
+            continue; // Try next model immediately
+          } else if (retryCount < maxRetries) {
+            const delay = retryDelays[retryCount];
+            logger.info(
+              `⏳ All FREE models busy, waiting ${delay}ms before retry ${retryCount + 1}/${maxRetries}...`,
+            );
+            await this.sleep(delay);
+            return this.generateResponse(query, context, retryCount + 1);
+          }
+        } else if (error.response?.status === 429) {
+          // Rate limited
+          if (retryCount < maxRetries) {
+            const delay = retryDelays[retryCount];
+            logger.info(
+              `⏳ Rate limited on FREE model, waiting ${delay}ms before retry...`,
+            );
+            await this.sleep(delay);
+            return this.generateResponse(query, context, retryCount + 1);
+          }
+        } else if (error.response?.status === 403) {
+          // Check if it's a quota exceeded error for free tier
+          const errorMsg = error.response?.data?.error?.message || "";
+          if (errorMsg.includes("quota") || errorMsg.includes("limit")) {
+            throw new Error(
+              "Free quota exceeded. Please wait or upgrade your plan.",
+            );
+          }
+          throw new Error("Invalid API key or insufficient permissions.");
+        } else if (error.response?.status === 404) {
+          logger.warn(`⚠️  FREE model ${model} not found, trying next...`);
+          if (modelIndex < this.models.length - 1) {
+            continue;
+          }
+        } else if (error.response?.status === 400) {
+          logger.error("❌ Bad request to Gemini API - check prompt format");
+          throw new Error("Invalid request format or parameters.");
+        } else if (error.code === "ECONNABORTED") {
+          logger.warn(`⚠️  Request timeout for FREE model ${model}`);
+          if (modelIndex < this.models.length - 1) {
+            continue;
+          } else if (retryCount < maxRetries) {
+            const delay = retryDelays[retryCount];
+            logger.info(`⏳ Timeout, waiting ${delay}ms before retry...`);
+            await this.sleep(delay);
+            return this.generateResponse(query, context, retryCount + 1);
+          }
+        }
+
+        // If it's the last model and last retry, throw the error
+        if (modelIndex === this.models.length - 1 && retryCount >= maxRetries) {
+          if (error.response?.status === 503) {
+            throw new Error(
+              "All FREE Gemini models are currently overloaded. Please try again in a few minutes.",
+            );
+          } else if (error.response?.status === 429) {
+            throw new Error(
+              "Rate limit exceeded on all FREE models. Please try again later.",
+            );
+          } else {
+            throw new Error(
+              `All FREE models failed after ${maxRetries + 1} attempts: ${error.message}`,
+            );
+          }
+        }
+      }
+    }
+
+    throw new Error("All FREE Gemini models are currently unavailable");
+  }
+
+  buildPrompt(query, context) {
+    // Optimized prompt for free models (shorter to save tokens)
+    const contextText = context
+      .map(
+        (item, index) =>
+          `[${index + 1}] ${item.title}: ${item.content.substring(0, 300)}...`,
+      )
+      .join("\n\n");
+
+    return `Based on these news articles, answer the question concisely:
+
+${contextText}
+
+Question: ${query}
+
+Answer:`;
+  }
+
+  // Helper method for delays
+  async sleep(ms) {
+    return new Promise((resolve) => setTimeout(resolve, ms));
+  }
+
+  // Enhanced error logging
+  logDetailedError(method, error) {
+    const errorDetails = {
+      method,
+      message: error.message,
+      status: error.response?.status,
+      statusText: error.response?.statusText,
+      responseData: error.response?.data,
+      requestUrl: error.config?.url?.replace(/key=[^&]+/, "key=[REDACTED]"),
+      code: error.code,
+    };
+
+    logger.error("FREE Gemini API error:", errorDetails);
+  }
+
+  // Test connection using free models only
+  async testConnection() {
+    try {
+      logger.info("🧪 Testing FREE Gemini API connection...");
+
+      const testContext = [
+        {
+          title: "Test Article",
+          content: "This is a simple test article about technology.",
+        },
+      ];
+
+      const response = await this.generateResponse(
+        "What is this article about?",
+        testContext,
+      );
+
+      if (response && typeof response === "string" && response.length > 0) {
+        logger.info("✅ FREE Gemini API connection test successful!");
+        logger.info(`📝 Generated response: ${response.substring(0, 100)}...`);
+        return true;
+      } else {
+        logger.error("❌ FREE Gemini API returned invalid response format");
+        return false;
+      }
+    } catch (error) {
+      logger.error("❌ FREE Gemini API connection test failed:", error.message);
+      return false;
+    }
+  }
+
+  // Quick test with the fastest free model
+  async quickTest() {
+    try {
+      const requestData = {
+        contents: [
+          {
+            parts: [
+              {
+                text: "Respond with exactly: 'FREE API working'",
+              },
+            ],
+          },
+        ],
+        generationConfig: {
+          maxOutputTokens: 10,
+        },
+      };
+
+      // Use the fastest free model for quick test
+      const response = await axios.post(
+        `${this.baseURL}/gemini-1.5-flash:generateContent?key=${this.apiKey}`,
+        requestData,
+        {
+          headers: { "Content-Type": "application/json" },
+          timeout: 10000,
+        },
+      );
+
+      if (response.data?.candidates?.[0]?.content?.parts?.[0]?.text) {
+        logger.info("✅ FREE Gemini quick test successful!");
+        return true;
+      }
+      return false;
+    } catch (error) {
+      if (error.response?.status === 503) {
+        logger.warn(
+          "⚠️  FREE Gemini is currently overloaded but API key is valid",
+        );
+      } else if (error.response?.status === 403) {
+        const errorMsg = error.response?.data?.error?.message || "";
+        if (errorMsg.includes("quota")) {
+          logger.warn("⚠️  FREE quota exceeded, but API key is valid");
+        }
+      }
+      return false;
+    }
+  }
+
+  // Get current usage information (if available in response)
+  logUsageInfo(response) {
+    if (response.data?.usageMetadata) {
+      const usage = response.data.usageMetadata;
+      logger.info(
+        `📊 Token usage - Input: ${usage.promptTokenCount}, Output: ${usage.candidatesTokenCount}, Total: ${usage.totalTokenCount}`,
+      );
+    }
+  }
+
+  // Validate API key format
+  validateApiKey() {
+    const apiKey = process.env.GEMINI_API_KEY;
+
+    if (!apiKey) {
+      return {
+        valid: false,
+        error: "Gemini API key is not set",
+      };
+    }
+
+    if (apiKey.trim().length < 20) {
+      return {
+        valid: false,
+        error: "Gemini API key appears to be invalid or too short",
+      };
+    }
+
+    return {
+      valid: true,
+    };
+  }
+
+  // Check which free models are currently available
+  async checkAvailableModels() {
+    const results = {};
+
+    for (const model of this.models) {
+      try {
+        const testData = {
+          contents: [{ parts: [{ text: "Hello" }] }],
+          generationConfig: { maxOutputTokens: 5 },
+        };
+
+        const response = await axios.post(
+          `${this.baseURL}/${model}:generateContent?key=${this.apiKey}`,
+          testData,
+          { headers: { "Content-Type": "application/json" }, timeout: 5000 },
+        );
+
+        results[model] = response.status === 200 ? "available" : "error";
+      } catch (error) {
+        if (error.response?.status === 503) {
+          results[model] = "overloaded";
+        } else if (error.response?.status === 403) {
+          results[model] = "quota_exceeded";
+        } else {
+          results[model] = "error";
+        }
+      }
+    }
+
+    logger.info("🔍 FREE model availability:", results);
+    return results;
+  }
+}
+
+module.exports = new GeminiService();
